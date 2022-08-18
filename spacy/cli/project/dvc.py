@@ -1,5 +1,5 @@
 """This module contains helpers and subcommands for integrating spaCy projects
-with Data Version Controk (DVC). https://dvc.org"""
+with Data Version Control (DVC). https://dvc.org"""
 from typing import Dict, Any, List, Optional, Iterable
 import subprocess
 from pathlib import Path
@@ -106,6 +106,11 @@ def update_dvc_config(
     dvc_commands = []
     config_commands = {cmd["name"]: cmd for cmd in config.get("commands", [])}
     for name in workflows[workflow]:
+        if isinstance(name, dict) and "parallel" in name:
+            msg.fail(
+                f"A DVC workflow may not contain parallel groups",
+                exits=1,
+            )
         command = config_commands[name]
         deps = command.get("deps", [])
         outputs = command.get("outputs", [])
@@ -123,6 +128,11 @@ def update_dvc_config(
             dvc_cmd.append("--always-changed")
         full_cmd = [*dvc_cmd, *deps_cmd, *outputs_cmd, *outputs_nc_cmd, *project_cmd]
         dvc_commands.append(join_command(full_cmd))
+    if len(dvc_commands) == 0:
+        msg.fail(
+            f"A DVC workflow must have at least one dependency or output",
+            exits=1,
+        )
     with working_dir(path):
         dvc_flags = {"--verbose": verbose, "--quiet": silent}
         run_dvc_commands(dvc_commands, flags=dvc_flags)

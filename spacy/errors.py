@@ -939,6 +939,7 @@ class Errors(metaclass=ErrorsWithCodes):
              "`{arg2}`={arg2_values} but these arguments are conflicting.")
     E1043 = ("Expected None or a value in range [{range_start}, {range_end}] for entity linker threshold, but got "
              "{value}.")
+    E1044 = ("Illegal transition from {old_state} to {new_state}.")
 
 
 # Deprecated model shortcuts, only used in errors and warnings
