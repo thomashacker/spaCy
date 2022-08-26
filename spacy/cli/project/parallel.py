@@ -11,25 +11,13 @@ of the states is documented alongside the _ParallelCommandInfo.STATES code. Note
 between the states 'failed' and 'terminated' is not meaningful on Windows, so that both are displayed
 as 'failed/terminated' on Windows systems.
 """
-from typing import (
-    Any,
-    List,
-    Optional,
-    Dict,
-    Union,
-    cast,
-    Iterator,
-    Literal,
-    ClassVar,
-    Protocol,
-    Tuple,
-)
+from typing import Any, List, Optional, Dict, cast, Iterator, ClassVar, Tuple
 import os
 import sys
 import queue
 from pathlib import Path
 from time import time
-from multiprocessing import Manager, Queue, get_context
+from multiprocessing import Manager, get_context
 from multiprocessing.context import SpawnProcess
 from tempfile import mkdtemp
 from signal import SIGTERM
@@ -82,23 +70,13 @@ class _Completed(_Message):
     console_output: str
 
 
-class _MessageQueue(Protocol):
-    def put(self, item: _Message) -> None:
-        ...
-
-    def get(self) -> _Message:
-        ...
-
-
-@dataclass
-class _ParallelCommandState:
-    name: str
-    display_color: str
-    # transitions: the names of states that can legally follow this state
-    transitions: List = field(default_factory=list)
-
-
-class _ParallelCommandInfo:
+class _ParallelCommand:
+    @dataclass
+    class _ParallelCommandState:
+        name: str
+        display_color: str
+        # transitions: the names of states that can legally follow this state
+        transitions: List = field(default_factory=list)
 
     STATES = (
         # The command has not yet been run
@@ -132,42 +110,63 @@ class _ParallelCommandInfo:
 
     state_dict = {state.name: state for state in STATES}
 
-    def __init__(self, cmd_name: str, cmd: Dict, cmd_index: int):
-        self.cmd_name = cmd_name
-        self.cmd = cmd
-        self.cmd_index = cmd_index
-        self.state = _ParallelCommandInfo.state_dict["pending"]
+    def __init__(
+        self, name: str, index: int, config_command: Dict, dry: bool, temp_log_dir: Path
+    ):
+        self.name = name
+        self.index = index
+        self.config_command = config_command
+        self.os_cmds = config_command["script"]
+        self.dry = dry
+        self.log_path = temp_log_dir / (self.name + ".log")
+        # we can use the command name as a unique log filename because a parallel
+        # group is not allowed to contain the same command more than once
+
+        self.state = _ParallelCommand.state_dict["pending"]
+        self.worker_process: Optional[SpawnProcess] = None
         self.pid: Optional[int] = None
         self.last_keepalive_time: Optional[int] = None
         self.running_os_cmd_index: Optional[int] = None
-        self.rc: Optional[int] = None
-        self.console_output: Optional[str] = None
+
+    def start(self, parallel_group_status_queue) -> None:
+        self.change_state("starting")
+        self.last_keepalive_time = int(time())
+        self.worker_process = _mp_context.Process(
+            target=_project_run_parallel_cmd,
+            args=[],
+            kwargs={
+                "cmd_index": self.index,
+                "os_cmds": self.os_cmds,
+                "dry": self.dry,
+                "log_path": self.log_path,
+                "parallel_group_status_queue": parallel_group_status_queue,
+            },
+        )
+        self.worker_process.start()
+
+    def terminate_if_alive(self):
+        if self.worker_process is not None and self.worker_process.is_alive():
+            self.worker_process.terminate()
 
     def change_state(self, new_state: str):
         if new_state not in self.state.transitions:
             raise RuntimeError(
                 Errors.E1044.format(old_state=self.state.name, new_state=new_state)
             )
-        self.state = _ParallelCommandInfo.state_dict[new_state]
+        self.state = _ParallelCommand.state_dict[new_state]
 
     @property
     def state_repr(self) -> str:
         state_str = self.state.name
         if state_str == "running" and self.running_os_cmd_index is not None:
-            number_of_os_cmds = len(self.cmd["script"])
             state_str = (
-                f"{state_str} ({self.running_os_cmd_index + 1}/{number_of_os_cmds})"
+                f"{state_str} ({self.running_os_cmd_index + 1}/{len(self.os_cmds)})"
             )
         elif state_str in ("failed", "terminated") and os.name == "nt":
             state_str = "failed/terminated"
         # we know ANSI commands are available because otherwise
         # the status table would not be being displayed in the first place
         return color(state_str, self.state.display_color)
-
-
-class _Worker:
-    cmd_info: _ParallelCommandInfo
-    process: SpawnProcess
 
 
 def project_run_parallel_group(
@@ -183,126 +182,65 @@ def project_run_parallel_group(
     when executing commands serially. Essentially, with parallel groups 'capture==True'.
 
     project_dir (Path): Path to project directory.
-    cmd_names: the names of the spaCy projects commands to run.
+    cmd_names: the names of the spaCy projects commands within the parallel group.
     overrides (Dict[str, Any]): Optional config overrides.
     force (bool): Force re-running, even if nothing changed.
     dry (bool): Perform a dry run and don't execute commands.
     """
-    config = load_project_config(project_dir, overrides=overrides)
-    commands = _read_commands_from_config(config, project_dir, dry=dry)
-    max_parallel_processes = config.get("max_parallel_processes")
-
-    temp_log_dir = mkdtemp()
+    temp_log_dir = Path(mkdtemp())
     _print_divider(cmd_names, temp_log_dir)
-    cmd_infos = [
-        _ParallelCommandInfo(cmd_name, commands[cmd_name], cmd_index)
-        for cmd_index, cmd_name in enumerate(cmd_names)
-    ]
 
+    config = load_project_config(project_dir, overrides=overrides)
+    parallel_cmds = _read_commands_from_config(
+        config, cmd_names, project_dir, dry, temp_log_dir
+    )
+    max_parallel_processes = config.get("max_parallel_processes", len(parallel_cmds))
     parallel_group_status_queue = Manager().Queue()
+
     with working_dir(project_dir) as current_dir:
-        worker_processes: List[SpawnProcess] = []
-        proc_to_cmd_infos: Dict[SpawnProcess, _ParallelCommandInfo] = {}
-        for cmd_info in cmd_infos:
-            if cmd_info.state.name == "not rerun":
+        for parallel_cmd in parallel_cmds:
+            if not _is_cmd_to_rerun(parallel_cmd, project_dir, current_dir, dry, force):
+                parallel_cmd.change_state("not rerun")
                 continue
-            # we can use the command name as a unique log filename because a parallel
-            # group is not allowed to contain the same command more than once
-            log_path = os.sep.join((temp_log_dir, cmd_info.cmd_name + ".log"))
-            # workers.append(_Worker(
-            #    cmd_info
-            # )
+            
+        next_cmd_to_start_iter = iter(c for c in parallel_cmds if c.state.name != "not rerun")
+        for _ in range(max_parallel_processes):
+            next_cmd = next(next_cmd_to_start_iter, None)
+            if next_cmd is not None:
+                next_cmd.start(parallel_group_status_queue)
+            else:
+                break
 
-            worker_process = _mp_context.Process(
-                target=_project_run_parallel_cmd,
-                args=[],
-                kwargs={
-                    "cmd_index": cmd_info.cmd_index,
-                    "script": cmd_info.cmd["script"],
-                    "dry": dry,
-                    "log_path": log_path,
-                    "parallel_group_status_queue": parallel_group_status_queue,
-                },
-            )
-            worker_processes.append(worker_process)
-            proc_to_cmd_infos[worker_process] = cmd_info
-
-        num_concurr_worker_processes = len(worker_processes)
-        if (
-            max_parallel_processes is not None
-            and max_parallel_processes < num_concurr_worker_processes
-        ):
-            num_concurr_worker_processes = max_parallel_processes
-
-        worker_process_iterator = iter(worker_processes)
-        for _ in range(num_concurr_worker_processes):
-            _start_worker_process(next(worker_process_iterator), proc_to_cmd_infos)
-        cmd_states = _process_worker_status_messages(
-            cmd_infos,
-            proc_to_cmd_infos,
+        completed_messages = _process_worker_status_messages(
+            parallel_cmds,
+            next_cmd_to_start_iter,
             parallel_group_status_queue,
-            worker_process_iterator,
             current_dir,
             dry,
         )
-        _report_command_states(cmd_states)
+        _report_command_states(
+            [(c.name, c.state.name, completed_messages[i])
+            for i, c in enumerate(parallel_cmds)
+            ])
         # Occasionally when something has hung there may still be worker processes to tidy up
-        for hung_worker_process in (wp for wp in worker_processes if wp.is_alive()):
-            hung_worker_process.terminate()
-        process_rcs = [c.rc for c in cmd_infos if c.rc is not None]
-        if len(process_rcs) > 0:
-            group_rc = max(process_rcs)
-            if group_rc > 0:
-                msg.fail("A command in the parallel group failed.")
-                sys.exit(group_rc)
-        if any(c for c in cmd_infos if c.state.name in ("hung", "terminated")):
+        for cmd in parallel_cmds:
+            cmd.terminate_if_alive()
+        group_rc = _get_group_rc(completed_messages)
+        if group_rc > 0:
+            msg.fail("A command in the parallel group failed.")
+            sys.exit(group_rc)
+        elif group_rc < 0:
             msg.fail("Command(s) in the parallel group hung or were terminated.")
-            sys.exit(-1)
-
-
-def _read_commands_from_config(config, project_dir, *, dry: bool) -> Dict[str, Dict]:
-    commands = {cmd["name"]: cmd for cmd in config.get("commands", [])}
-    commands = {}
-    for command in commands:
-        # Throws an exception if the dependencies aren't correct.
-        check_deps(command, command["name"], project_dir, dry)
-        commands[command["name"]] = command
-    return commands
-
-
-def _report_command_states(cmd_states: List[Tuple[str, str, Optional[str]]]):
-    for name, state, console_output in cmd_states:
-        if state != "cancelled":
-            msg.divider(name)
-            if state == "not rerun":
-                msg.info(f"Skipping '{name}': nothing changed")
-            elif console_output is not None:
-                print(console_output)
-
-
-def _print_divider(cmd_names: List[str], temp_log_dir: str) -> None:
-    divider_parallel_descriptor = parallel_descriptor = (
-        "parallel[" + ", ".join(cmd_names) + "]"
-    )
-    if len(divider_parallel_descriptor) > _MAX_WIDTH_DIVIDER:
-        divider_parallel_descriptor = (
-            divider_parallel_descriptor[: (_MAX_WIDTH_DIVIDER - 3)] + "..."
-        )
-    msg.divider(divider_parallel_descriptor)
-    if not _DISPLAY_STATUS_TABLE and len(parallel_descriptor) > _MAX_WIDTH_DIVIDER:
-        # reprint the descriptor if it was too long and had to be cut short
-        print(parallel_descriptor)
-    msg.info("Temporary logs are being written to " + temp_log_dir)
+            sys.exit(group_rc)
 
 
 def _process_worker_status_messages(
-    cmd_infos: List[_ParallelCommandInfo],
-    proc_to_cmd_infos: Dict[SpawnProcess, _ParallelCommandInfo],
+    parallel_cmds: List[_ParallelCommand],
+    next_cmd_to_start_iter: Iterator[_ParallelCommand],
     parallel_group_status_queue: queue.Queue,
-    worker_process_iterator: Iterator[SpawnProcess],
     current_dir: Path,
     dry: bool,
-) -> List[Tuple[str, str, Optional[str]]]:
+) -> List[Optional[_Completed]]:
     """Listen on the status queue and process messages received from the worker processes.
 
     cmd_infos: a list of info objects about the commands in the parallel group.
@@ -314,10 +252,9 @@ def _process_worker_status_messages(
     dry (bool): Perform a dry run and don't execute commands.
     """
     status_table_not_yet_displayed = True
-    states = []
+    completed_messages: List[Optional[_Completed]] = [None for _ in parallel_cmds]
     while any(
-        cmd_info.state.name in ("pending", "starting", "running")
-        for cmd_info in cmd_infos
+        cmd.state.name in ("pending", "starting", "running") for cmd in parallel_cmds
     ):
         try:
             mess = parallel_group_status_queue.get(
@@ -325,75 +262,144 @@ def _process_worker_status_messages(
             )
         except queue.Empty:
             # No more messages are being received: the whole group has hung
-            for other_cmd_info in (
-                c for c in cmd_infos if c.state.name in ("starting", "running")
-            ):
-                other_cmd_info.change_state("hung")
-            for other_cmd_info in (c for c in cmd_infos if c.state.name == "pending"):
-                other_cmd_info.change_state("cancelled")
+            _cancel_hung_group(parallel_cmds)
             break
-        cmd_info = cmd_infos[mess.cmd_index]
+        _check_for_hung_cmds(parallel_cmds)
+        cmd = parallel_cmds[mess.cmd_index]
         if isinstance(mess, (_Started, _KeepAlive)):
-            cmd_info.last_keepalive_time = int(time())
-        for other_cmd_info in (
-            c for c in cmd_infos if c.state.name in ("starting", "running")
-        ):
-            if (
-                other_cmd_info.last_keepalive_time is not None
-                and time() - other_cmd_info.last_keepalive_time
-                > _PARALLEL_GROUP_STATUS_INTERVAL * 20
-            ):
-                # a specific command has hung
-                other_cmd_info.change_state("hung")
+            cmd.last_keepalive_time = int(time())
         if isinstance(mess, _Started):
-            cmd_info.change_state("running")
-            cmd_info.running_os_cmd_index = mess.os_cmd_index
-            cmd_info.pid = mess.pid
+            cmd.change_state("running")
+            cmd.running_os_cmd_index = mess.os_cmd_index
+            cmd.pid = mess.pid
         elif isinstance(mess, _Completed):
-            cmd_info.rc = mess.rc
-            if cmd_info.rc == 0:
-                cmd_info.change_state("succeeded")
+            completed_messages[mess.cmd_index] = mess
+            if mess.rc == 0:
+                cmd.change_state("succeeded")
                 if not dry:
-                    update_lockfile(current_dir, cmd_info.cmd)
-                next_worker_process = next(worker_process_iterator, None)
-                if next_worker_process is not None:
-                    _start_worker_process(next_worker_process, proc_to_cmd_infos)
-            elif cmd_info.rc > 0:
-                cmd_info.change_state("failed")
+                    update_lockfile(current_dir, cmd.config_command)
+                next_cmd = next(next_cmd_to_start_iter, None)
+                if next_cmd is not None:
+                    next_cmd.start(parallel_group_status_queue)
+            elif mess.rc > 0:
+                cmd.change_state("failed")
             else:
-                cmd_info.change_state("terminated")
-            cmd_info.console_output = mess.console_output
+                cmd.change_state("terminated")
         if any(
-            c for c in cmd_infos if c.state.name in ("failed", "terminated", "hung")
+            c for c in parallel_cmds if c.state.name in ("failed", "terminated", "hung")
         ):
             # a command in the group hasn't succeeded, so terminate/cancel the rest
-            for other_cmd_info in (c for c in cmd_infos if c.state.name == "running"):
-                try:
-                    os.kill(cast(int, other_cmd_info.pid), SIGTERM)
-                except ProcessLookupError:
-                    # the subprocess the main process is trying to kill could already
-                    # have completed, and the message from the worker process notifying
-                    # the main process about this could still be in the queue
-                    pass
-            for other_cmd_info in (c for c in cmd_infos if c.state.name == "pending"):
-                other_cmd_info.change_state("cancelled")
+            _cancel_failed_group(parallel_cmds)
         if not isinstance(mess, _KeepAlive) and _DISPLAY_STATUS_TABLE:
             if status_table_not_yet_displayed:
                 status_table_not_yet_displayed = False
             else:
                 # overwrite the existing status table
-                print("\033[2K\033[F" * (4 + len(cmd_infos)))
-            data = [[c.cmd_name, c.state_repr] for c in cmd_infos]
+                print("\033[2K\033[F" * (4 + len(parallel_cmds)))
+            data = [[c.name, c.state_repr] for c in parallel_cmds]
             header = ["Command", "Status"]
             msg.table(data, header=header)
+    return completed_messages
+
+
+def _cancel_failed_group(parallel_cmds):
+    for cmd in (c for c in parallel_cmds if c.state.name == "running"):
+        try:
+            os.kill(cast(int, cmd.pid), SIGTERM)
+        except ProcessLookupError:
+            # the subprocess the main process is trying to kill could already
+            # have completed, and the message from the worker process notifying
+            # the main process about this could still be in the queue
+            pass
+    for cmd in (c for c in parallel_cmds if c.state.name == "pending"):
+        cmd.change_state("cancelled")
+
+
+def _cancel_hung_group(parallel_cmds):
+    for cmd in (c for c in parallel_cmds if c.state.name in ("starting", "running")):
+        cmd.change_state("hung")
+    for cmd in (c for c in parallel_cmds if c.state.name == "pending"):
+        cmd.change_state("cancelled")
+
+
+def _check_for_hung_cmds(parallel_cmds):
+    for cmd in (c for c in parallel_cmds if c.state.name in ("starting", "running")):
+        if (
+            cmd.last_keepalive_time is not None
+            and time() - cmd.last_keepalive_time > _PARALLEL_GROUP_STATUS_INTERVAL * 20
+        ):
+            # a specific command has hung
+            cmd.change_state("hung")
+
+
+def _read_commands_from_config(
+    config, cmd_names: List[str], project_dir, dry, temp_log_dir
+) -> List[_ParallelCommand]:
+    config_cmds = {cmd["name"]: cmd for cmd in config.get("commands", [])}
+    for cmd_name in config_cmds:
+        check_deps(config_cmds[cmd_name], cmd_name, project_dir, dry)
+    return [
+        _ParallelCommand(name, index, config_cmds[name], dry, temp_log_dir)
+        for index, name in enumerate(cmd_names)
+    ]
+
+
+def _is_cmd_to_rerun(parallel_cmd, project_dir, current_dir, dry, force) -> bool:
+    check_spacy_commit = check_bool_env_var(ENV_VARS.PROJECT_USE_GIT_VERSION)
+    return (
+        check_rerun(
+            current_dir,
+            parallel_cmd.config_command,
+            check_spacy_commit=check_spacy_commit,
+        )
+        or force
+    )
+
+
+def _report_command_states(cmd_states: List[Tuple[str, str, Optional[_Completed]]]):
+    for name, state, completed_message in cmd_states:
+        if state != "cancelled":
+            msg.divider(name)
+            if state == "not rerun":
+                msg.info(f"Skipping '{name}': nothing changed")
+            elif completed_message is not None:
+                print(completed_message.console_output)
+
+
+def _print_divider(cmd_names: List[str], temp_log_dir: Path) -> None:
+    divider_parallel_descriptor = parallel_descriptor = (
+        "parallel[" + ", ".join(cmd_names) + "]"
+    )
+    if len(divider_parallel_descriptor) > _MAX_WIDTH_DIVIDER:
+        divider_parallel_descriptor = (
+            divider_parallel_descriptor[: (_MAX_WIDTH_DIVIDER - 3)] + "..."
+        )
+    msg.divider(divider_parallel_descriptor)
+    if not _DISPLAY_STATUS_TABLE and len(parallel_descriptor) > _MAX_WIDTH_DIVIDER:
+        # reprint the descriptor if it was too long and had to be cut short
+        print(parallel_descriptor)
+    msg.info("Temporary logs are being written to " + str(temp_log_dir))
+
+
+def _get_group_rc(completed_messages: List[Optional[_Completed]]) -> int:
+    set_rcs = [mess.rc for mess in completed_messages if mess is not None]
+    if len(set_rcs) == 0:
+        return 0
+    max_rc = max(set_rcs)
+    if max_rc > 0:
+        return max_rc
+    min_rc = min(set_rcs)
+    if min_rc < 0:
+        return min_rc
+    return 0
 
 
 def _project_run_parallel_cmd(
     *,
     cmd_index: int,
-    script: List[str],
+    os_cmds: Dict,
     dry: bool,
-    log_path: str,
+    log_path: Path,
     parallel_group_status_queue: queue.Queue,
 ) -> None:
     """Run a single spaCy projects command as a worker process.
@@ -411,16 +417,16 @@ def _project_run_parallel_cmd(
     # buffering=0: make sure output is not lost if a subprocess is terminated
     # The return code will be 0 if the group succeeded,
     # or the return code of the first failing item.
-    with open(log_path, "wb", buffering=0) as logfile:
-        return_code = _run_command_items(
+    with log_path.open("wb", buffering=0) as logfile:
+        return_code = _run_os_cmds(
             cmd_index,
-            script,
+            os_cmds,
             logfile,
             parallel_group_status_queue,
             dry,
         )
 
-    with open(log_path, "r") as logfile:
+    with log_path.open("r") as logfile:
         parallel_group_status_queue.put(
             _Completed(
                 cmd_index=cmd_index,
@@ -430,11 +436,11 @@ def _project_run_parallel_cmd(
         )
 
 
-def _run_command_items(
-    cmd_index: int, script: List[str], logfile, status_queue: queue.Queue, dry: bool
+def _run_os_cmds(
+    cmd_index: int, os_cmds: Dict, logfile, status_queue: queue.Queue, dry: bool
 ) -> int:
-    for os_cmd_index, os_cmd in enumerate(script):
-        command = _get_command(os_cmd)
+    for os_cmd_index, os_cmd in enumerate(os_cmds):
+        command = _get_os_cmd(os_cmd)
         logfile.write(
             bytes(
                 f"Running command: {join_command(command)}" + os.linesep,
@@ -450,7 +456,7 @@ def _run_command_items(
                 )
             )
         else:
-            rc = _run_command(
+            rc = _run_os_cmd(
                 cmd_index,
                 os_cmd_index,
                 command,
@@ -462,7 +468,7 @@ def _run_command_items(
     return 0
 
 
-def _get_command(os_cmd: str) -> List[str]:
+def _get_os_cmd(os_cmd: str) -> List[str]:
     command = split_command(os_cmd)
     if len(command) and command[0] in ("python", "python3"):
         # -u: prevent buffering within Python
@@ -474,7 +480,7 @@ def _get_command(os_cmd: str) -> List[str]:
     return command
 
 
-def _run_command(
+def _run_os_cmd(
     cmd_index: int,
     os_cmd_index: int,
     command: List[str],
@@ -510,7 +516,8 @@ def _run_command(
             pid=sp.pid,
         )
     )
-    while sp.returncode != None:
+
+    while sp.returncode == None:
         try:
             sp.wait(timeout=_PARALLEL_GROUP_STATUS_INTERVAL)
         except TimeoutExpired:
@@ -535,20 +542,3 @@ def _run_command(
                 )
             )
     return sp.returncode
-
-
-def _start_worker_process(
-    worker_process: SpawnProcess,
-    proc_to_cmd_infos: Dict[SpawnProcess, _ParallelCommandInfo],
-) -> None:
-    """Start a worker process, changing the state of its info object.
-
-    worker_process: the worker process to start.
-    proc_to_cmd_infos: a dictionary from worker processes to
-        the info objects that describe them.
-    """
-    cmd_info = proc_to_cmd_infos[worker_process]
-    if cmd_info.state.name == "pending":
-        cmd_info.change_state("starting")
-        cmd_info.last_keepalive_time = int(time())
-        worker_process.start()
