@@ -96,12 +96,17 @@ class _ParallelCommand:
         _ParallelCommandState("starting", "green", ["running", "failed", "hung"]),
         # The command is running
         _ParallelCommandState(
-            "running", "green", ["running", "succeeded", "failed", "terminated", "hung"]
+            "running",
+            "green",
+            ["running", "succeeded", "failed", "terminating", "terminated", "hung"],
         ),
         # The command succeeded (rc=0)
         _ParallelCommandState("succeeded", "green"),
-        # The command failed (rc>0)
+        # The command failed, or was terminated on Windows platforms (rc>0)
         _ParallelCommandState("failed", "red"),
+        # The main process has terminated the currently running subprocess but has not yet received
+        # an acknowledgement from the worker process.
+        _ParallelCommandState("terminating", "red", ["failed", "terminated"]),
         # The command was terminated (rc<0), usually but not necessarily by the main process because
         # another command within the same parallel group failed
         _ParallelCommandState("terminated", "red"),
@@ -162,6 +167,8 @@ class _ParallelCommand:
         self.pid = mess.pid
 
     def terminate_if_alive(self) -> None:
+        # terminates the worker process itself, while the 'state' field tracks the
+        # information returned by the worker process about its subprocess(es)
         if self.worker_process is not None and self.worker_process.is_alive():
             self.worker_process.terminate()
 
@@ -246,11 +253,11 @@ def project_run_parallel_group(
         if group_rc > 0:
             msg.fail("A command in the parallel group failed.")
             sys.exit(group_rc)
-        elif group_rc < 0:
-            msg.fail("Command(s) in the parallel group were terminated.")
-            sys.exit(group_rc)
         elif any(1 for c in parallel_cmds if c.state.name == "hung"):
             msg.fail("Command(s) in the parallel group hung.")
+            sys.exit(group_rc)
+        elif group_rc < 0:
+            msg.fail("Command(s) in the parallel group were terminated.")
             sys.exit(group_rc)
 
 
@@ -274,7 +281,8 @@ def _process_worker_status_messages(
     status_table_not_yet_displayed = True
     completed_messages: List[Optional[_Completed]] = [None for _ in parallel_cmds]
     while any(
-        cmd.state.name in ("pending", "starting", "running") for cmd in parallel_cmds
+        cmd.state.name in ("pending", "starting", "running", "terminating")
+        for cmd in parallel_cmds
     ):
         try:
             mess = parallel_group_status_queue.get(timeout=_KEEPALIVE_MAX_LATENCY)
@@ -368,12 +376,14 @@ def _cancel_not_succeeded_group(parallel_cmds: List[_ParallelCommand]) -> None:
     has not succeeded.
     """
     for cmd in (c for c in parallel_cmds if c.state.name == "running"):
+        cmd.change_state("terminating")
         try:
             os.kill(cast(int, cmd.pid), SIGTERM)
-        except ProcessLookupError:
+        except:
             # the subprocess the main process is trying to kill could already
             # have completed, and the message from the worker process notifying
-            # the main process about this could still be in the queue
+            # the main process about this could still be in the queue.
+            # Various errors would result depending on the OS.
             pass
     for cmd in (c for c in parallel_cmds if c.state.name == "pending"):
         cmd.change_state("cancelled")
@@ -381,7 +391,11 @@ def _cancel_not_succeeded_group(parallel_cmds: List[_ParallelCommand]) -> None:
 
 def _cancel_hung_group(parallel_cmds: List[_ParallelCommand]) -> None:
     """Handle the situation where the whole group has stopped responding."""
-    for cmd in (c for c in parallel_cmds if c.state.name in ("starting", "running")):
+    for cmd in (
+        c
+        for c in parallel_cmds
+        if c.state.name in ("starting", "running", "terminating")
+    ):
         cmd.change_state("hung")
     for cmd in (c for c in parallel_cmds if c.state.name == "pending"):
         cmd.change_state("cancelled")
@@ -390,7 +404,11 @@ def _cancel_hung_group(parallel_cmds: List[_ParallelCommand]) -> None:
 def _check_for_hung_cmds(parallel_cmds: List[_ParallelCommand]) -> None:
     """Check whether individual commands within the group have stopped responding
     and, if any are found, mark this on their status"""
-    for cmd in (c for c in parallel_cmds if c.state.name in ("starting", "running")):
+    for cmd in (
+        c
+        for c in parallel_cmds
+        if c.state.name in ("starting", "running", "terminating")
+    ):
         if (
             cmd.last_keepalive_time is not None
             and time() - cmd.last_keepalive_time > _KEEPALIVE_MAX_LATENCY
