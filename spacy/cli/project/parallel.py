@@ -337,7 +337,7 @@ def _read_commands_from_config(
     config, cmd_names: List[str], current_dir: Path, dry: bool, temp_log_dir: Path
 ) -> List[_ParallelCommand]:
     config_cmds = {cmd["name"]: cmd for cmd in config.get("commands", [])}
-    for name in config_cmds:
+    for name in (n for n in config_cmds if n in cmd_names):
         check_deps(config_cmds[name], name, current_dir, dry)
     return [
         _ParallelCommand(config_cmds[name], index, dry, temp_log_dir)
