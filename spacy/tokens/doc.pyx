@@ -19,7 +19,7 @@ import warnings
 
 from .span cimport Span
 from .token cimport MISSING_DEP
-from ._dict_proxies import SpanGroups
+from .span_groups import SpanGroups
 from .token cimport Token
 from ..lexeme cimport Lexeme, EMPTY_LEXEME
 from ..typedefs cimport attr_t, flags_t
@@ -35,8 +35,8 @@ from .. import util
 from .. import parts_of_speech
 from .. import schemas
 from .underscore import Underscore, get_ext_args
-from ._retokenize import Retokenizer
-from ._serialize import ALL_ATTRS as DOCBIN_ALL_ATTRS
+from .retokenizer import Retokenizer
+from .doc_bin import ALL_ATTRS as DOCBIN_ALL_ATTRS
 from ..util import get_words_and_spaces
 
 DEF PADDING = 5
@@ -245,6 +245,7 @@ cdef class Doc:
         self.length = 0
         self.sentiment = 0.0
         self.cats = {}
+        self.activations = {}
         self.user_hooks = {}
         self.user_token_hooks = {}
         self.user_span_hooks = {}
@@ -808,27 +809,33 @@ cdef class Doc:
                     self.c[i].ent_iob = 1
                 self.c[i].ent_type = span.label
                 self.c[i].ent_kb_id = span.kb_id
-                # for backwards compatibility in v3, only set ent_id from
-                # span.id if it's set, otherwise don't override
-                self.c[i].ent_id = span.id if span.id else self.c[i].ent_id
+                self.c[i].ent_id = span.id
         for span in blocked:
             for i in range(span.start, span.end):
                 self.c[i].ent_iob = 3
                 self.c[i].ent_type = 0
+                self.c[i].ent_kb_id = 0
+                self.c[i].ent_id = 0
         for span in missing:
             for i in range(span.start, span.end):
                 self.c[i].ent_iob = 0
                 self.c[i].ent_type = 0
+                self.c[i].ent_kb_id = 0
+                self.c[i].ent_id = 0
         for span in outside:
             for i in range(span.start, span.end):
                 self.c[i].ent_iob = 2
                 self.c[i].ent_type = 0
+                self.c[i].ent_kb_id = 0
+                self.c[i].ent_id = 0
 
         # Set tokens outside of all provided spans
         if default != SetEntsDefault.unmodified:
             for i in range(self.length):
                 if i not in seen_tokens:
                     self.c[i].ent_type = 0
+                    self.c[i].ent_kb_id = 0
+                    self.c[i].ent_id = 0
                     if default == SetEntsDefault.outside:
                         self.c[i].ent_iob = 2
                     elif default == SetEntsDefault.missing:
@@ -968,22 +975,26 @@ cdef class Doc:
             py_attr_ids = [(IDS[id_.upper()] if hasattr(id_, "upper") else id_)
                        for id_ in py_attr_ids]
         except KeyError as msg:
-            keys = [k for k in IDS.keys() if not k.startswith("FLAG")]
+            keys = list(IDS.keys())
             raise KeyError(Errors.E983.format(dict="IDS", key=msg, keys=keys)) from None
         # Make an array from the attributes --- otherwise our inner loop is
         # Python dict iteration.
-        cdef np.ndarray attr_ids = numpy.asarray(py_attr_ids, dtype="i")
-        output = numpy.ndarray(shape=(self.length, len(attr_ids)), dtype=numpy.uint64)
+        cdef Pool mem = Pool()
+        cdef int n_attrs = len(py_attr_ids)
+        cdef attr_id_t* c_attr_ids
+        if n_attrs > 0:
+            c_attr_ids = <attr_id_t*>mem.alloc(n_attrs, sizeof(attr_id_t))
+            for i, attr_id in enumerate(py_attr_ids):
+                c_attr_ids[i] = attr_id
+        output = numpy.ndarray(shape=(self.length, n_attrs), dtype=numpy.uint64)
         c_output = <attr_t*>output.data
-        c_attr_ids = <attr_id_t*>attr_ids.data
         cdef TokenC* token
-        cdef int nr_attr = attr_ids.shape[0]
         for i in range(self.length):
             token = &self.c[i]
-            for j in range(nr_attr):
-                c_output[i*nr_attr + j] = get_token_attr(token, c_attr_ids[j])
+            for j in range(n_attrs):
+                c_output[i*n_attrs + j] = get_token_attr(token, c_attr_ids[j])
         # Handle 1d case
-        return output if len(attr_ids) >= 2 else output.reshape((self.length,))
+        return output if n_attrs >= 2 else output.reshape((self.length,))
 
     def count_by(self, attr_id_t attr_id, exclude=None, object counts=None):
         """Count the frequencies of a given attribute. Produces a dict of

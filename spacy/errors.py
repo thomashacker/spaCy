@@ -252,7 +252,7 @@ class Errors(metaclass=ErrorsWithCodes):
     E012 = ("Cannot add pattern for zero tokens to matcher.\nKey: {key}")
     E016 = ("MultitaskObjective target should be function or one of: dep, "
             "tag, ent, dep_tag_offset, ent_tag.")
-    E017 = ("Can only add unicode or bytes. Got type: {value_type}")
+    E017 = ("Can only add 'str' inputs to StringStore. Got type: {value_type}")
     E018 = ("Can't retrieve string for hash '{hash_value}'. This usually "
             "refers to an issue with the `Vocab` or `StringStore`.")
     E019 = ("Can't create transition with unknown action ID: {action}. Action "
@@ -460,13 +460,13 @@ class Errors(metaclass=ErrorsWithCodes):
             "same, but found '{nlp}' and '{vocab}' respectively.")
     E152 = ("The attribute {attr} is not supported for token patterns. "
             "Please use the option `validate=True` with the Matcher, PhraseMatcher, "
-            "EntityRuler or AttributeRuler for more details.")
+            "SpanRuler or AttributeRuler for more details.")
     E153 = ("The value type {vtype} is not supported for token patterns. "
             "Please use the option validate=True with Matcher, PhraseMatcher, "
-            "EntityRuler or AttributeRuler for more details.")
+            "SpanRuler or AttributeRuler for more details.")
     E154 = ("One of the attributes or values is not supported for token "
             "patterns. Please use the option `validate=True` with the Matcher, "
-            "PhraseMatcher, or EntityRuler for more details.")
+            "PhraseMatcher, or SpanRuler for more details.")
     E155 = ("The pipeline needs to include a {pipe} in order to use "
             "Matcher or PhraseMatcher with the attribute {attr}. "
             "Try using `nlp()` instead of `nlp.make_doc()` or `list(nlp.pipe())` "
@@ -490,7 +490,7 @@ class Errors(metaclass=ErrorsWithCodes):
             "Current DocBin: {current}\nOther DocBin: {other}")
     E169 = ("Can't find module: {module}")
     E170 = ("Cannot apply transition {name}: invalid for the current state.")
-    E171 = ("Matcher.add received invalid 'on_match' callback argument: expected "
+    E171 = ("{name}.add received invalid 'on_match' callback argument: expected "
             "callable or None, but got: {arg_type}")
     E175 = ("Can't remove rule for unknown match pattern ID: {key}")
     E176 = ("Alias '{alias}' is not defined in the Knowledge Base.")
@@ -540,6 +540,8 @@ class Errors(metaclass=ErrorsWithCodes):
     E199 = ("Unable to merge 0-length span at `doc[{start}:{end}]`.")
     E200 = ("Can't set {attr} from Span.")
     E202 = ("Unsupported {name} mode '{mode}'. Supported modes: {modes}.")
+    E203 = ("If the {name} embedding layer is not updated "
+            "during training, make sure to include it in 'annotating components'")
 
     # New errors added in v3.x
     E853 = ("Unsupported component factory name '{name}'. The character '.' is "
@@ -711,9 +713,9 @@ class Errors(metaclass=ErrorsWithCodes):
             "`nlp.enable_pipe` instead.")
     E927 = ("Can't write to frozen list. Maybe you're trying to modify a computed "
             "property or default function argument?")
-    E928 = ("A KnowledgeBase can only be serialized to/from from a directory, "
+    E928 = ("An InMemoryLookupKB can only be serialized to/from from a directory, "
             "but the provided argument {loc} points to a file.")
-    E929 = ("Couldn't read KnowledgeBase from {loc}. The path does not seem to exist.")
+    E929 = ("Couldn't read InMemoryLookupKB from {loc}. The path does not seem to exist.")
     E930 = ("Received invalid get_examples callback in `{method}`. "
             "Expected function that returns an iterable of Example objects but "
             "got: {obj}")
@@ -741,7 +743,7 @@ class Errors(metaclass=ErrorsWithCodes):
             "loaded nlp object, but got: {source}")
     E947 = ("`Matcher.add` received invalid `greedy` argument: expected "
             "a string value from {expected} but got: '{arg}'")
-    E948 = ("`Matcher.add` received invalid 'patterns' argument: expected "
+    E948 = ("`{name}.add` received invalid 'patterns' argument: expected "
             "a list, but got: {arg_type}")
     E949 = ("Unable to align tokens for the predicted and reference docs. It "
             "is only possible to align the docs when both texts are the same "
@@ -915,8 +917,6 @@ class Errors(metaclass=ErrorsWithCodes):
     E1021 = ("`pos` value \"{pp}\" is not a valid Universal Dependencies tag. "
              "Non-UD tags should use the `tag` property.")
     E1022 = ("Words must be of type str or int, but input is of type '{wtype}'")
-    E1023 = ("Couldn't read EntityRuler from the {path}. This file doesn't "
-             "exist.")
     E1024 = ("A pattern with {attr_type} '{label}' is not present in "
              "'{component}' patterns.")
     E1025 = ("Cannot intify the value '{value}' as an IOB string. The only "
@@ -944,6 +944,17 @@ class Errors(metaclass=ErrorsWithCodes):
              "case pass an empty list for the previously not specified argument to avoid this error.")
     E1043 = ("Expected None or a value in range [{range_start}, {range_end}] for entity linker threshold, but got "
              "{value}.")
+    E1044 = ("Expected `candidates_batch_size` to be >= 1, but got: {value}")
+    E1045 = ("Encountered {parent} subclass without `{parent}.{method}` "
+             "method in '{name}'. If you want to use this method, make "
+             "sure it's overwritten on the subclass.")
+    E1046 = ("{cls_name} is an abstract class and cannot be instantiated. If you are looking for spaCy's default "
+             "knowledge base, use `InMemoryLookupKB`.")
+
+    # v4 error strings
+    E4000 = ("Expected a Doc as input, but got: '{type}'")
+    E4001 = ("Expected input to be one of the following types: ({expected_types}), "
+             "but got '{received_type}'")
 
 
 # Deprecated model shortcuts, only used in errors and warnings

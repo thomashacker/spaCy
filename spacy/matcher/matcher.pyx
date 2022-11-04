@@ -22,7 +22,7 @@ from ..attrs cimport ID, attr_id_t, NULL_ATTR, ORTH, POS, TAG, DEP, LEMMA, MORPH
 
 from ..schemas import validate_token_pattern
 from ..errors import Errors, MatchPatternError, Warnings
-from ..strings import get_string_id
+from ..strings cimport get_string_id
 from ..attrs import IDS
 
 
@@ -110,9 +110,9 @@ cdef class Matcher:
         """
         errors = {}
         if on_match is not None and not hasattr(on_match, "__call__"):
-            raise ValueError(Errors.E171.format(arg_type=type(on_match)))
-        if patterns is None or not isinstance(patterns, List):  # old API
-            raise ValueError(Errors.E948.format(arg_type=type(patterns)))
+            raise ValueError(Errors.E171.format(name="Matcher", arg_type=type(on_match)))
+        if patterns is None or not isinstance(patterns, List):
+            raise ValueError(Errors.E948.format(name="Matcher", arg_type=type(patterns)))
         if greedy is not None and greedy not in ["FIRST", "LONGEST"]:
             raise ValueError(Errors.E947.format(expected=["FIRST", "LONGEST"], arg=greedy))
         for i, pattern in enumerate(patterns):
@@ -260,6 +260,10 @@ cdef class Matcher:
         # non-overlapping ones this `match` can be either (start, end) or
         # (start, end, alignments) depending on `with_alignments=` option.
         for key, *match in matches:
+            # Adjust span matches to doc offsets
+            if isinstance(doclike, Span):
+                match[0] += doclike.start
+                match[1] += doclike.start
             span_filter = self._filter.get(key)
             if span_filter is not None:
                 pairs = pairs_by_id.get(key, [])
@@ -290,9 +294,6 @@ cdef class Matcher:
         if as_spans:
             final_results = []
             for key, start, end, *_ in final_matches:
-                if isinstance(doclike, Span):
-                    start += doclike.start
-                    end += doclike.start
                 final_results.append(Span(doc, start, end, label=key))
         elif with_alignments:
             # convert alignments List[Dict[str, int]] --> List[int]
